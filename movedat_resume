@@ -4,18 +4,9 @@
 # functionality by ignoring already completely downloaded files, resuming 
 # interrupted files, and downloading not-yet-downloaded files.
 # 
-# The wrapper is strictly for downloading, and assumes the last two arguments 
-# given are a remote source and a local destination, respectively.
-#
-# Single files can be downloaded, in addition to directories.
-#
-# Attempts to use movedat's other capabilities (directory listing, file 
-# renaming, uploading to a remote server, etc) through this wrapper will 
-# fail spectacularly.
-#
 # Written by Aaron Browne brownea@email.chop.edu 
 # Center for Biomedical Informatics, Children's Hospital of Philadelphia
-# Last update on 10/23/13
+# Last update on 10/30/13
 
 get_movedat_path() {
 
