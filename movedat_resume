@@ -17,10 +17,46 @@
 # Center for Biomedical Informatics, Children's Hospital of Philadelphia
 # Last update on 10/23/13
 
+get_movedat_path() {
 
+  get_path_args="${@}"
+  # Initialize movedat path to find it in the $PATH
+  movedat_path="movedat"
+  # Find and process the -l option for movedat path if it exists
+  for opt in "${@}"; do
+    if [[ "${opt}" == "-l" ]]; then
+      # Get movedat path
+      movedat_path="${2}"
+    fi
+    shift
+  done
+  # Hacky bash way to 'return' a result
+  echo "${movedat_path}"
+
+} 
+
+pass_to_movedat() {
+
+  # Get the movedat path
+  movedat_path=$( get_movedat_path "${@}" )
+
+  # Exit if movedat path doesn't lead to an executable movedat binary
+  if ! command -v "${movedat_path}" >/dev/null 2>&1; then
+    printf "Error: ${movedat_path} not found or not executable.\n"
+    exit 1
+  fi
+
+  # Remove -l and its argument from movedat args
+  pass_args="${@}"
+  pass_args="${pass_args//-l/}"
+  pass_args="${pass_args//${movedat_path}/}"
+  echo $pass_args
+  ${movedat_path} ${pass_args}
+
+}
+
+# Set the usage message and number of arguments and original args
 usage=$(printf "Usage: %s [-l movedat_path] [movedat args]" $0)
-
-# Extract arguments needed for script
 numargs=$#
 
 # Exit with usage message if no arguments given
@@ -29,103 +65,87 @@ if [[ "${numargs}" == 0 ]]; then
   exit 0
 fi
 
+# If not resuming a directory download, pass everything to movedat and exit
+if ! [[ "${@}" == *-h* && ( "${@}" == *-y* || "${@}" == *-r* ) ]]; then
+  printf "Notice: Directory resume options (-h and (-y or -r)) not given, passing to movedat.\n"
+  pass_to_movedat "${@}"
+  exit 0
+fi
+
 # Assume dest is last argument and src is second to last
 dest="${@:numargs:1}"
 src="${@:numargs-1:1}"
 
-# Remove trailing slash from destination
+# Remove trailing slash from destination and source
 dest="${dest%/}"
+src="${src%/}"
 
-# Split source into server name (with un) and path
+# If attempting a directory upload, pass everything to movedat and exit
+if [[ "${dest}" == *:* ]]; then 
+  printf "Warning: Directory UPLOAD detected, passing to stock movedat.\n"
+  pass_to_movedat "${@}"
+  exit 0
+fi
+
+# From here, we assume we are resuming a directory download:
+
+# Split source into server name (with username) and path
 src_path="${src#*:}"
 src_serv="${src%:*}"
+
+# Permanently cache password
+$( get_movedat_path ${@} ) -A ${src_serv}: 
 
 # Remove trailing slash from source path
 src_path="${src_path%/}"
 
-# Will pass the rest to movedat
-passargs="${@:1:numargs-2}"
+# Will pass the remaining args (including -l, but excluding directory and resume
+# related args) through pass_to_movedat
+extra_args="${@:1:numargs-2}"
+extra_args="${extra_args//-h/}"
+extra_args="${extra_args//-r/}"
+extra_args="${extra_args//-y/}"
 
-# Remove directory and resume related arguments
-passargs="${passargs//-h/}"
-passargs="${passargs//-r/}"
-passargs="${passargs//-y/}"
+# Allow user to break loop with Ctrl-C
+trap break SIGINT
 
-# Initialize movedat path to empty string
-movedat_path="movedat"
-# Find and process the -l option for movedat path
-for opt in "${@}"; do
-  if [[ "${opt}" == "-l" ]]; then
-    # Get movedat path
-    movedat_path="${2}"
-    # Remove -l and its argument from movedat args
-    passargs="${passargs//${2}/}"
-    passargs="${passargs//-l/}"
+# Read through structured list
+while read path hex_size mod ftype mode id desc; do
+
+  # Create local destination path
+  dest_path="${dest}${path#${src_path}}"
+
+  # Ignore hidden files
+  if [[ "${ftype}" == *h* ]]; then
+    continue
   fi
-  shift
-done
 
-# Exit if movedat path doesn't lead to an executable movedat binary
-if ! command -v "${movedat_path}" >/dev/null 2>&1; then
-  printf "Error: ${movedat_path} not found or not executable.\n"
-  exit 1
-fi
+  # Create directories locally
+  if [[ "${ftype}" == "D" ]]; then
+    mkdir -p "${dest_path}"
+  fi
 
-# Try to describe the source using movedat and exit if it fails
-src_attr=$(${movedat_path} ${src}=*ls)
-if [[ $? != 0 ]]; then printf "Error: Source inspection failed.\n"; exit 2; fi
-
-# Extract the file type from the source description
-src_attr_array=( ${src_attr} )
-src_type="${src_attr_array[16]}"
-
-# If src is a file, then download it and exit
-if [[ "${src_type}" == F* ]]; then
-  ${movedat_path} ${passargs} ${src} ${dest}
-  exit 0
-fi
-
-# If src is a directory, then go into directory download loop
-if [[ "${src_type}" == D* ]]; then
-  # Allow user to break loop with Ctrl-C
-  trap break SIGINT
-  
-  # Read through structured list
-  while read path hex_size mod ftype mode id desc; do
-  
-    # Create local destination path
-    dest_path="${dest}${path#${src_path}}"
-  
-    # Ignore hidden files
-    if [[ "${ftype}" == *h* ]]; then
-      continue
-    fi
-  
-    # Create directories locally
-    if [[ "${ftype}" == "D" ]]; then
-      mkdir -p "${dest_path}"
-    fi
-  
-    # Branching logic for files
-    if [[ "${ftype}" == "F" ]]; then
-      # Convert source size from hex to dec
-      src_dec_size=$(echo "ibase=16; ${hex_size}" | bc)
-      # If file exists locally and is the same size, then ignore
-      # otherwise, download with the 'yes' option to resume or download new
-      if [[ -e "${dest_path}" ]] && 
-        [[ $(stat -f %z "${dest_path}") == "${src_dec_size}" ]]; then
+  # Branching logic for files
+  if [[ "${ftype}" == "F" ]]; then
+    # Convert source size from hex to dec
+    src_dec_size=$(echo "ibase=16; ${hex_size}" | bc)
+    # If file exists locally and is the same size, then ignore
+    # otherwise, download with the 'yes' option to resume or download new
+    if [[ -e "${dest_path}" ]]; then
+      # Account for different stat options in OSX
+      if [[ $( uname ) == "Darwin" ]]; then
+        local_size=$( stat -f %z "${dest_path}" )
+      else
+        local_size=$( stat -c %s "${dest_path}" )
+      fi
+      if [[ "${local_size}" == "${src_dec_size}" ]]; then
         printf "Automatically skipping completed download:\n  %s\n" ${dest_path} 
         continue
-      else
-        ${movedat_path} -y ${passargs} ${src_serv}:${path} ${dest_path}
       fi
+    else
+      pass_to_movedat -y ${extra_args} ${src_serv}:${path} ${dest_path}
     fi
-  done < <(${movedat_path} ${src}=*lr) 
-  exit 0
-fi
+  fi
+done < <( $( get_movedat_path ${@} ) ${src}=*lr ) 
+exit 0
 
-
-# If src is neither file nor directory, notify user and exit
-printf "Warning: Source is neither a regular file nor a directory. "
-printf "No action taken.\n"
-exit 3
