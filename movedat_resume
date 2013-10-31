@@ -46,9 +46,169 @@ pass_to_movedat() {
 
 }
 
+upload_dir() {
+ 
+  # Assume dest is last argument and src is second to last
+  dest="${@:numargs:1}"
+  src="${@:numargs-1:1}"
+  
+  # Remove trailing slash from destination and add to source
+  dest="${dest%/}"
+  src="${src%/}/"
+
+  # Split destination into server name (with username) and path
+  dest_path="${dest#*:}"
+  dest_serv="${dest%:*}"
+
+  # Permanently cache password
+  $( get_movedat_path ${@} ) -A ${dest_serv}:
+
+  # Will pass the remaining args (including -l, but excluding directory and resume
+  # related args) through pass_to_movedat
+  extra_args="${@:1:numargs-2}"
+  extra_args="${extra_args//-h/}"
+  extra_args="${extra_args//-r/}"
+  extra_args="${extra_args//-y/}"
+
+  # Allow user to break loop with Ctrl-C
+  trap break SIGINT
+
+  # Read through a recursive long listing of local source dir
+  while read line; do
+
+    # Reset directory flag and file name, leave last directory name for next file
+    dir_tf=false
+    file_name=""
+
+    # If the line is a directory, put up the flag and remove trailing colon
+    # If the line is empty or a total or long directory listing, ignore
+    # Otherwise, get the file name (last field) from the line
+    if [[ "${line}" == *: ]]; then
+      dir_tf=true
+      directory="${line%:}"
+    elif [[ "${line}" == "" || "${line}" == total* || "${line}" == d* ]]; then
+      continue
+    else
+      file_name="${line##* }"
+    fi
+
+    # Create location by putting the last directory line together with a file name, 
+    # if the file name exists (if not its just a directory)
+    location="${directory}/${file_name}"
+    location="${location%/}"
+
+    # Create remote destination path and skip if empty
+    write_path="${dest_path}${location#${src}}"
+    if [[ "${write_path}" == "" ]]; then continue; fi
+
+    # Try to get a description of the file at destination path from movedat
+    write_info=( $( $( get_movedat_path ${@} ) ${dest_serv}:${write_path}=*ls 2>/dev/null ) )
+    # Record the exit status as a proxy for existence at the destination
+    exists="$?"
+    # If the file is not a directory, check file size. If the file size is the same,
+    # ignore, if not, upload with 'yes' option to resume or overwrite. (Non-existent files
+    # will also get uploaded because dest_dec_size will be empty)
+    if [[ "${dir_tf}" == "false" ]]; then
+      hex_size="${write_info[14]}"
+      # Convert remote hex size to decimal size
+      dest_dec_size=$( echo "ibase=16; ${hex_size}" | bc )
+      # Account for different stat options in OSX
+      if [[ $( uname ) == "Darwin" ]]; then
+        local_size=$( stat -f %z "${location}" )
+      else
+        local_size=$( stat -c %s "${location}" )
+      fi
+      if [[ "${local_size}" == "${dest_dec_size}" ]]; then
+        printf "Automatically skipping completed upload:\n  %s\n" ${location}
+        continue
+      else
+        pass_to_movedat -y ${extra_args} ${location} ${dest_serv}:${write_path}
+      fi
+    # If it is a directory, and it doesn't exist remotely yet, use movedat's special 
+    # folder creation syntax.
+    elif [[ "${exists}" != "0" ]]; then
+      pass_to_movedat -n ${extra_args} ${dest_serv}:${write_path}
+    fi
+
+  done < <( ls -R -l ${src} ) 
+
+}
+
+download_dir() {
+
+  # Assume dest is last argument and src is second to last
+  dest="${@:numargs:1}"
+  src="${@:numargs-1:1}"
+  
+  # Remove trailing slash from destination and source
+  dest="${dest%/}"
+  src="${src%/}"
+  
+  # Split source into server name (with username) and path
+  src_path="${src#*:}"
+  src_serv="${src%:*}"
+  
+  # Permanently cache password
+  $( get_movedat_path ${@} ) -A ${src_serv}: 
+  
+  # Will pass the remaining args (including -l, but excluding directory and resume
+  # related args) through pass_to_movedat
+  extra_args="${@:1:numargs-2}"
+  extra_args="${extra_args//-h/}"
+  extra_args="${extra_args//-r/}"
+  extra_args="${extra_args//-y/}"
+  
+  # Allow user to break loop with Ctrl-C
+  trap break SIGINT
+  
+  # Read through structured list of remote dir from movedat
+  while read path hex_size mod ftype mode id desc; do
+  
+    # Create local destination path
+    write_path="${dest}${path#${src_path}}"
+  
+    # Ignore hidden files
+    if [[ "${ftype}" == *h* ]]; then
+      continue
+    fi
+  
+    # Create directories locally
+    if [[ "${ftype}" == "D" ]]; then
+      mkdir -p "${write_path}"
+    fi
+  
+    # Branching logic for files
+    if [[ "${ftype}" == "F" ]]; then
+      # Convert source size from hex to dec
+      src_dec_size=$( echo "ibase=16; ${hex_size}" | bc )
+      # If file exists locally and is the same size, then ignore
+      # otherwise, download with the 'yes' option to resume or download new
+      if [[ -e "${write_path}" ]]; then
+        # Account for different stat options in OSX
+        if [[ $( uname ) == "Darwin" ]]; then
+          local_size=$( stat -f %z "${write_path}" )
+        else
+          local_size=$( stat -c %s "${write_path}" )
+        fi
+        if [[ "${local_size}" == "${src_dec_size}" ]]; then
+          printf "Automatically skipping completed download:\n  %s\n" ${write_path} 
+          continue
+        fi
+      else
+        pass_to_movedat -y ${extra_args} ${src_serv}:${path} ${write_path}
+      fi
+    fi
+  done < <( $( get_movedat_path ${@} ) ${src}=*lr ) 
+
+}
+
 # Set the usage message and number of arguments and original args
 usage=$(printf "Usage: %s [-l movedat_path] [movedat args]" $0)
 numargs=$#
+
+# Assume dest is last argument and src is second to last
+dest="${@:numargs:1}"
+src="${@:numargs-1:1}"
 
 # Exit with usage message if no arguments given
 if [[ "${numargs}" == 0 ]]; then
@@ -58,85 +218,19 @@ fi
 
 # If not resuming a directory download, pass everything to movedat and exit
 if ! [[ "${@}" == *-h* && ( "${@}" == *-y* || "${@}" == *-r* ) ]]; then
-  printf "Notice: Directory resume options (-h and (-y or -r)) not given, passing to movedat.\n"
   pass_to_movedat "${@}"
   exit 0
 fi
 
-# Assume dest is last argument and src is second to last
-dest="${@:numargs:1}"
-src="${@:numargs-1:1}"
-
-# Remove trailing slash from destination and source
-dest="${dest%/}"
-src="${src%/}"
-
-# If attempting a directory upload, pass everything to movedat and exit
+# Use different directory loop for upload and download 
 if [[ "${dest}" == *:* ]]; then 
-  printf "Warning: Directory UPLOAD detected, passing to stock movedat.\n"
-  pass_to_movedat "${@}"
+  upload_dir "${@}"
+  exit 0
+elif [[ "${src}" == *:* ]]; then
+  download_dir "${@}"
   exit 0
 fi
 
-# From here, we assume we are resuming a directory download:
-
-# Split source into server name (with username) and path
-src_path="${src#*:}"
-src_serv="${src%:*}"
-
-# Permanently cache password
-$( get_movedat_path ${@} ) -A ${src_serv}: 
-
-# Remove trailing slash from source path
-src_path="${src_path%/}"
-
-# Will pass the remaining args (including -l, but excluding directory and resume
-# related args) through pass_to_movedat
-extra_args="${@:1:numargs-2}"
-extra_args="${extra_args//-h/}"
-extra_args="${extra_args//-r/}"
-extra_args="${extra_args//-y/}"
-
-# Allow user to break loop with Ctrl-C
-trap break SIGINT
-
-# Read through structured list
-while read path hex_size mod ftype mode id desc; do
-
-  # Create local destination path
-  dest_path="${dest}${path#${src_path}}"
-
-  # Ignore hidden files
-  if [[ "${ftype}" == *h* ]]; then
-    continue
-  fi
-
-  # Create directories locally
-  if [[ "${ftype}" == "D" ]]; then
-    mkdir -p "${dest_path}"
-  fi
-
-  # Branching logic for files
-  if [[ "${ftype}" == "F" ]]; then
-    # Convert source size from hex to dec
-    src_dec_size=$(echo "ibase=16; ${hex_size}" | bc)
-    # If file exists locally and is the same size, then ignore
-    # otherwise, download with the 'yes' option to resume or download new
-    if [[ -e "${dest_path}" ]]; then
-      # Account for different stat options in OSX
-      if [[ $( uname ) == "Darwin" ]]; then
-        local_size=$( stat -f %z "${dest_path}" )
-      else
-        local_size=$( stat -c %s "${dest_path}" )
-      fi
-      if [[ "${local_size}" == "${src_dec_size}" ]]; then
-        printf "Automatically skipping completed download:\n  %s\n" ${dest_path} 
-        continue
-      fi
-    else
-      pass_to_movedat -y ${extra_args} ${src_serv}:${path} ${dest_path}
-    fi
-  fi
-done < <( $( get_movedat_path ${@} ) ${src}=*lr ) 
-exit 0
-
+# Exit with status 2 because nothing was done, something went wrong.
+printf "Error: No action taken, something went wrong.\n"
+exit 2
