@@ -22,7 +22,7 @@ get_movedat_path() {
     shift
   done
   # Hacky bash way to 'return' a result
-  echo "${movedat_path}"
+  printf "${movedat_path}"
 
 } 
 
@@ -41,7 +41,6 @@ pass_to_movedat() {
   pass_args="${@}"
   pass_args="${pass_args//-l/}"
   pass_args="${pass_args//${movedat_path}/}"
-  echo $pass_args
   ${movedat_path} ${pass_args}
 
 }
