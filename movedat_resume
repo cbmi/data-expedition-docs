@@ -106,18 +106,19 @@ upload_dir() {
     exists="$?"
     # If the file is not a directory, check file size. If the file size is the same,
     # ignore, if not, upload with 'yes' option to resume or overwrite. (Non-existent files
-    # will also get uploaded because dest_dec_size will be empty)
+    # will also get uploaded by checking the exit status of the remote listing)
     if [[ "${dir_tf}" == "false" ]]; then
       hex_size="${write_info[14]}"
       # Convert remote hex size to decimal size
       dest_dec_size=$( echo "ibase=16; ${hex_size}" | bc )
-      # Account for different stat options in OSX
-      if [[ $( uname ) == "Darwin" ]]; then
-        local_size=$( stat -f %z "${location}" )
-      else
-        local_size=$( stat -c %s "${location}" )
-      fi
-      if [[ "${local_size}" == "${dest_dec_size}" ]]; then
+      # First try the *nix version of local file size estimation
+      local_size=$( stat -c %s "${location}" 2>/dev/null )
+      # If that doesn't work, try the OSX version
+      if [[ "$?" != "0" ]]; then local_size=$( stat -f %z "${location}" 2>/dev/null ); fi
+      # If that doesn't work, just assume the size matches
+      if [[ "$?" != "0" ]]; then local_size="${dest_dec_size}"; fi
+      # Compare local to remote size and skip if equal and file exists
+      if [[ "${local_size}" == "${dest_dec_size}" ]] && [[ "${exists}" == "0" ]]; then
         printf "Automatically skipping completed upload:\n  %s\n" ${location}
         continue
       else
@@ -165,7 +166,7 @@ download_dir() {
   
     # Create local destination path
     write_path="${dest}${path#${src_path}}"
-  
+
     # Ignore hidden files
     if [[ "${ftype}" == *h* ]]; then
       continue
@@ -180,15 +181,17 @@ download_dir() {
     if [[ "${ftype}" == "F" ]]; then
       # Convert source size from hex to dec
       src_dec_size=$( echo "ibase=16; ${hex_size}" | bc )
+      echo "src_dec_size: ${src_dec_size}"
       # If file exists locally and is the same size, then ignore
       # otherwise, download with the 'yes' option to resume or download new
       if [[ -e "${write_path}" ]]; then
-        # Account for different stat options in OSX
-        if [[ $( uname ) == "Darwin" ]]; then
-          local_size=$( stat -f %z "${write_path}" )
-        else
-          local_size=$( stat -c %s "${write_path}" )
-        fi
+        # First try the *nix version of local file size estimation
+        local_size=$( stat -c %s "${write_path}" 2>/dev/null )
+        # If that doesn't work, try the OSX version
+        if [[ "$?" != "0" ]]; then local_size=$( stat -f %z "${write_path}" 2>/dev/null ); fi
+        # If that doesn't work, just assume the size matches
+        if [[ "$?" != "0" ]]; then local_size="${dest_dec_size}"; fi
+        # Compare local size to remote size and skip if they match
         if [[ "${local_size}" == "${src_dec_size}" ]]; then
           printf "Automatically skipping completed download:\n  %s\n" ${write_path} 
           continue
